@@ -1,0 +1,1 @@
+Currently in the middle of making a trading algorithm that can visualize data from crypto exchanges and predict future market pricing through ML
