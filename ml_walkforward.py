@@ -1,18 +1,20 @@
-"""Milestone 3: walk-forward machine learning on candle features.
+"""Milestone 3b: walk-forward machine learning on candle features.
+
+Works on daily OR hourly candles: set TIMEFRAME in patterns_and_backtest.py.
 
 Run:  python ml_walkforward.py
 Needs: trading.db and patterns_and_backtest.py in the same folder, plus
        pip install scikit-learn
 
 Question the script answers: can a model that only sees PAST data predict
-whether a 5-day trade will make money after fees, better than random entries?
+whether a trade will make money after fees, better than random entries?
 
 How it avoids fooling itself
   * Walk-forward: train on the past, predict the next 90 days, then slide
     forward and retrain. The model never predicts data it was trained on.
-  * Purging: the last HOLD_DAYS of training rows are dropped, because their
+  * Purging: the last HOLD_BARS of training rows are dropped, because their
     labels are built from prices inside the test period.
-  * Same backtester, same fees, trades start at the NEXT day's open.
+  * Same backtester, same fees, trades start at the NEXT bar's open.
   * Random-entry baseline shown as a distribution, not a single average.
 """
 import sqlite3
@@ -27,21 +29,27 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 from patterns_and_backtest import (
-    DB_PATH, FEE, HOLD_DAYS, SYMBOL,
+    BARS_PER_DAY, DATE_FMT, DB_PATH, FEE, HOLD_BARS, SYMBOL, TIMEFRAME,
     add_features, add_patterns, backtest, load_candles, summarize,
 )
 
-MIN_TRAIN_DAYS = 1000   # size of the first training window
-TEST_BLOCK_DAYS = 90    # predict this many days, then retrain
+MIN_TRAIN_BARS = 1000 * BARS_PER_DAY    # first training window (about 2.7 years)
+TEST_BLOCK_BARS = 90 * BARS_PER_DAY     # predict this much, then retrain
 MARGIN = 0.03           # trade only if P(up) beats the training base rate by this much
 RANDOM_RUNS = 300       # random-entry simulations for the baseline
 
 PATTERNS = ["doji", "hammer", "bullish_engulfing", "bearish_engulfing"]
-FEATURES = [
-    "daily_return", "range_pct", "body_ratio", "upper_shadow", "lower_shadow",
-    "volatility_20d", "volume_change", "ret_3d", "ret_5d", "ret_10d", "ret_20d",
-    "dist_ma20", "dist_ma50", "rsi_14", "volume_ratio_20d",
-] + PATTERNS
+# Look-back windows in bars. On hourly data this adds 1-day and 1-week returns.
+HORIZONS = [3, 5, 10, 20] + ([BARS_PER_DAY, 7 * BARS_PER_DAY] if BARS_PER_DAY > 1 else [])
+# Time-of-day / day-of-week (hourly only), encoded as circles so 23:00 is next to 00:00.
+TIME_FEATURES = ["hour_sin", "hour_cos", "dow_sin", "dow_cos"] if BARS_PER_DAY > 1 else []
+FEATURES = (
+    ["bar_return", "range_pct", "body_ratio", "upper_shadow", "lower_shadow",
+     "volatility_20", "volume_change"]
+    + [f"ret_{n}" for n in HORIZONS]
+    + ["dist_ma20", "dist_ma50", "rsi_14", "volume_ratio_20"]
+    + TIME_FEATURES + PATTERNS
+)
 
 MODELS = {
     "logistic": lambda: make_pipeline(
@@ -54,11 +62,11 @@ MODELS = {
 
 # ------------------------------------------------------- features + label
 def add_ml_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Extra features. Each uses only data up to and including today's close."""
+    """Extra features. Each uses only data up to and including the current bar's close."""
     df = df.copy()
     close = df["close"]
-    for n in (3, 5, 10, 20):
-        df[f"ret_{n}d"] = close.pct_change(n)
+    for n in HORIZONS:
+        df[f"ret_{n}"] = close.pct_change(n)
     df["dist_ma20"] = close / close.rolling(20).mean() - 1
     df["dist_ma50"] = close / close.rolling(50).mean() - 1
     delta = close.diff()
@@ -66,9 +74,13 @@ def add_ml_features(df: pd.DataFrame) -> pd.DataFrame:
     loss = (-delta.clip(upper=0)).rolling(14).mean()
     rs = gain / loss.replace(0, np.nan)
     df["rsi_14"] = 100 - 100 / (1 + rs)
-    df.loc[(loss == 0) & (gain > 0), "rsi_14"] = 100.0   # 14 days with no down moves
+    df.loc[(loss == 0) & (gain > 0), "rsi_14"] = 100.0   # 14 bars with no down moves
     df.loc[(loss == 0) & (gain == 0), "rsi_14"] = 50.0   # completely flat
-    df["volume_ratio_20d"] = df["volume"] / df["volume"].rolling(20).mean()
+    df["volume_ratio_20"] = df["volume"] / df["volume"].rolling(20).mean()
+    if TIME_FEATURES:
+        hour, dow = df["date"].dt.hour, df["date"].dt.dayofweek
+        df["hour_sin"], df["hour_cos"] = np.sin(2 * np.pi * hour / 24), np.cos(2 * np.pi * hour / 24)
+        df["dow_sin"], df["dow_cos"] = np.sin(2 * np.pi * dow / 7), np.cos(2 * np.pi * dow / 7)
     for p in PATTERNS:
         df[p] = df[p].astype(int)
     df[FEATURES] = df[FEATURES].replace([np.inf, -np.inf], np.nan)
@@ -76,12 +88,12 @@ def add_ml_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_label(df: pd.DataFrame) -> pd.DataFrame:
-    """target = 1 if a trade entered at tomorrow's open and sold at the close
-    HOLD_DAYS later makes money AFTER fees. This matches the backtester exactly.
+    """target = 1 if a trade entered at the next bar's open and sold at the close
+    HOLD_BARS later makes money AFTER fees. This matches the backtester exactly.
     The label looks into the future on purpose; it is never used as a feature."""
     df = df.copy()
     entry = df["open"].shift(-1)
-    exit_ = df["close"].shift(-HOLD_DAYS)
+    exit_ = df["close"].shift(-HOLD_BARS)
     net = exit_ / entry * (1 - FEE) / (1 + FEE) - 1
     df["target"] = np.where(net.isna(), np.nan, (net > 0).astype(float))
     return df
@@ -98,11 +110,11 @@ def walk_forward(df: pd.DataFrame, make_model):
 
     proba = np.full(n, np.nan)
     thresh = np.full(n, np.nan)
-    first_test = first_valid + MIN_TRAIN_DAYS
+    first_test = first_valid + MIN_TRAIN_BARS
     s = first_test
     while s < n:
-        e = min(s + TEST_BLOCK_DAYS, n)
-        train = np.arange(first_valid, s - HOLD_DAYS + 1)   # purge the last HOLD_DAYS
+        e = min(s + TEST_BLOCK_BARS, n)
+        train = np.arange(first_valid, s - HOLD_BARS + 1)   # purge the last HOLD_BARS
         train = train[valid[train]]                          # skip rows with missing features
         model = make_model()
         model.fit(X[train], y[train])
@@ -129,20 +141,22 @@ def random_returns(df: pd.DataFrame, frequency: float, runs: int, seed: int = 42
 # -------------------------------------------------------------------- main
 if __name__ == "__main__":
     df = add_ml_features(add_label(add_patterns(add_features(load_candles(SYMBOL)))))
-    if len(df) < MIN_TRAIN_DAYS + TEST_BLOCK_DAYS + 100:
-        raise SystemExit(f"Only {len(df)} rows; need more history. Re-run fetch_and_plot.py.")
+    if len(df) < MIN_TRAIN_BARS + TEST_BLOCK_BARS + 100:
+        raise SystemExit(f"Only {len(df):,} candles; need at least "
+                         f"{MIN_TRAIN_BARS + TEST_BLOCK_BARS + 100:,}. Fetch more history.")
 
     results, all_proba, curves, pred_rows = [], {}, {}, []
     first_test = None
     for name, make_model in MODELS.items():
+        print(f"Training {name} (walk-forward)...", flush=True)
         proba, thresh, first_test = walk_forward(df, make_model)
         all_proba[name] = (proba, thresh)
 
     ev = df.iloc[first_test:].reset_index(drop=True)          # evaluation window
-    print(f"{SYMBOL}: {len(df)} days. Out-of-sample window: "
-          f"{ev['date'].min():%Y-%m-%d} to {ev['date'].max():%Y-%m-%d} ({len(ev)} days)")
-    print(f"Retrained every {TEST_BLOCK_DAYS} days on all earlier data; "
-          f"fee {FEE:.1%} per side; hold {HOLD_DAYS} days.\n")
+    print(f"\n{SYMBOL} ({TIMEFRAME}): {len(df):,} candles. Out-of-sample window: "
+          f"{ev['date'].min():%Y-%m-%d} to {ev['date'].max():%Y-%m-%d} ({len(ev):,} candles)")
+    print(f"Retrained every {TEST_BLOCK_BARS:,} bars on all earlier data; "
+          f"fee {FEE:.1%} per side; hold {HOLD_BARS} bars.\n")
 
     hold = ev["close"].to_numpy() / ev["close"].iloc[0]
     row = summarize("buy_and_hold", hold, np.array([hold[-1] - 1]), 1.0)
@@ -159,11 +173,11 @@ if __name__ == "__main__":
         sig = (p > pd.Series(thresh[first_test:])).fillna(False)
         hit = y[ok & sig].mean() if (ok & sig).any() else float("nan")
         print(f"  {name:11s} AUC {auc:.3f} (0.500 = coin flip) | base rate P(up) {y[ok].mean():.1%}"
-              f" | P(up) when it signals {hit:.1%} on {int((ok & sig).sum())} signals")
+              f" | P(up) when it signals {hit:.1%} on {int((ok & sig).sum()):,} signals")
 
         equity, trades, exposure = backtest(ev, sig)
         rand = random_returns(ev, float(sig.mean()), RANDOM_RUNS)
-        row = summarize(f"{name} ({HOLD_DAYS}d hold)", equity, trades, exposure)
+        row = summarize(f"{name} ({HOLD_BARS}-bar hold)", equity, trades, exposure)
         row["beats_random"] = f"{(rand < equity[-1] - 1).mean():.0%} of runs"
         results.append(row)
         row = {"strategy": "  random entries, median", "trades": "-", "win_rate": "-",
@@ -174,20 +188,22 @@ if __name__ == "__main__":
         curves[name] = equity
         for d, pr in zip(ev["date"], p):
             if not np.isnan(pr):
-                pred_rows.append((d.strftime("%Y-%m-%d"), name, float(pr)))
+                pred_rows.append((d.strftime(DATE_FMT), name, float(pr)))
 
     print("\nBacktest on the out-of-sample window:")
     print(pd.DataFrame(results).to_string(index=False))
     print("\n'beats_random' = share of random-entry runs (same trade frequency) the model beat.")
     print("Around 50% means no edge; you want it near 95%+ AND an AUC clearly above 0.5.")
 
+    table = "ml_predictions" if TIMEFRAME == "1d" else f"ml_predictions_{TIMEFRAME}"
     with sqlite3.connect(DB_PATH) as conn:
         pd.DataFrame(pred_rows, columns=["date", "model", "p_up"]).to_sql(
-            "ml_predictions", conn, if_exists="replace", index=False)
+            table, conn, if_exists="replace", index=False)
 
+    step = BARS_PER_DAY          # plot one point per day so hourly charts stay fast
     fig = go.Figure()
     for label, curve in curves.items():
-        fig.add_trace(go.Scatter(x=ev["date"], y=curve, name=label))
+        fig.add_trace(go.Scatter(x=ev["date"].iloc[::step], y=curve[::step], name=label))
     fig.update_layout(title="Out-of-sample equity curves (start = 1.0)", yaxis_type="log")
     fig.write_html("equity_ml.html")
     fig.show()
