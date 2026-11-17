@@ -30,7 +30,7 @@ from sklearn.preprocessing import StandardScaler
 
 from patterns_and_backtest import (
     BARS_PER_DAY, DATE_FMT, DB_PATH, FEE, HOLD_BARS, SYMBOL, TIMEFRAME,
-    add_features, add_patterns, backtest, load_candles, summarize,
+    add_features, add_patterns, backtest, load_candles, random_returns, summarize,
 )
 
 MIN_TRAIN_BARS = 1000 * BARS_PER_DAY    # first training window (about 2.7 years)
@@ -127,17 +127,6 @@ def walk_forward(df: pd.DataFrame, make_model):
     return proba, thresh, first_test
 
 
-def random_returns(df: pd.DataFrame, frequency: float, runs: int, seed: int = 42):
-    """Total returns of many random-entry strategies trading as often as the model."""
-    rng = np.random.default_rng(seed)
-    out = []
-    for _ in range(runs):
-        fake = pd.Series(rng.random(len(df)) < frequency)
-        equity, _, _ = backtest(df, fake)
-        out.append(equity[-1] - 1)
-    return np.array(out)
-
-
 # -------------------------------------------------------------------- main
 if __name__ == "__main__":
     df = add_ml_features(add_label(add_patterns(add_features(load_candles(SYMBOL)))))
@@ -176,7 +165,7 @@ if __name__ == "__main__":
               f" | P(up) when it signals {hit:.1%} on {int((ok & sig).sum()):,} signals")
 
         equity, trades, exposure = backtest(ev, sig)
-        rand = random_returns(ev, float(sig.mean()), RANDOM_RUNS)
+        rand = random_returns(ev, len(trades), RANDOM_RUNS)   # same number of trades = same fee drag
         row = summarize(f"{name} ({HOLD_BARS}-bar hold)", equity, trades, exposure)
         row["beats_random"] = f"{(rand < equity[-1] - 1).mean():.0%} of runs"
         results.append(row)
@@ -192,7 +181,7 @@ if __name__ == "__main__":
 
     print("\nBacktest on the out-of-sample window:")
     print(pd.DataFrame(results).to_string(index=False))
-    print("\n'beats_random' = share of random-entry runs (same trade frequency) the model beat.")
+    print("\n'beats_random' = share of random-entry runs (same NUMBER of trades) the model beat.")
     print("Around 50% means no edge; you want it near 95%+ AND an AUC clearly above 0.5.")
 
     table = "ml_predictions" if TIMEFRAME == "1d" else f"ml_predictions_{TIMEFRAME}"
