@@ -78,7 +78,7 @@ def add_ml_features(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[(loss == 0) & (gain == 0), "rsi_14"] = 50.0   # completely flat
     df["volume_ratio_20"] = df["volume"] / df["volume"].rolling(20).mean()
     if TIME_FEATURES:
-        hour, dow = df["date"].dt.hour, df["date"].dt.dayofweek
+        hour, dow = df["date"].dt.hour, df["date"].dt.day_of_week
         df["hour_sin"], df["hour_cos"] = np.sin(2 * np.pi * hour / 24), np.cos(2 * np.pi * hour / 24)
         df["dow_sin"], df["dow_cos"] = np.sin(2 * np.pi * dow / 7), np.cos(2 * np.pi * dow / 7)
     for p in PATTERNS:
@@ -87,34 +87,44 @@ def add_ml_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def add_label(df: pd.DataFrame) -> pd.DataFrame:
+def add_label(df: pd.DataFrame, hold: int = HOLD_BARS) -> pd.DataFrame:
     """target = 1 if a trade entered at the next bar's open and sold at the close
     HOLD_BARS later makes money AFTER fees. This matches the backtester exactly.
     The label looks into the future on purpose; it is never used as a feature."""
     df = df.copy()
     entry = df["open"].shift(-1)
-    exit_ = df["close"].shift(-HOLD_BARS)
-    net = exit_ / entry * (1 - FEE) / (1 + FEE) - 1
-    df["target"] = np.where(net.isna(), np.nan, (net > 0).astype(float))
+    exit_ = df["close"].shift(-hold)
+    gross = exit_ / entry - 1                                # return before fees
+    net = exit_ / entry * (1 - FEE) / (1 + FEE) - 1          # return after fees
+    df["fwd_ret"] = gross
+    df["target"] = np.where(net.isna(), np.nan, (net > 0).astype(float))      # clears the fees
+    df["target_raw"] = np.where(gross.isna(), np.nan, (gross > 0).astype(float))  # price went up
     return df
 
 
 # ------------------------------------------------------------ walk-forward
-def walk_forward(df: pd.DataFrame, make_model):
-    """Return out-of-sample P(up), per-row trade thresholds, first test row."""
+def walk_forward(df: pd.DataFrame, make_model, hold: int = HOLD_BARS,
+                 features=None, target: str = "target"):
+    """Return out-of-sample P(label=1), the training base rate per row, first test row.
+
+    features: columns the model may use (default: all of them).
+    target:   label column to predict.
+    hold:     how many bars the label looks ahead (used to purge each training set).
+    The test window is the same whichever features are used."""
+    features = features or FEATURES
     n = len(df)
-    X = df[FEATURES].to_numpy()
-    y = df["target"].to_numpy()
+    X = df[features].to_numpy()
+    y = df[target].to_numpy()
     valid = ~np.isnan(X).any(axis=1)
-    first_valid = int(np.argmax(valid))
+    first_valid = int(np.argmax(~np.isnan(df[FEATURES].to_numpy()).any(axis=1)))
 
     proba = np.full(n, np.nan)
-    thresh = np.full(n, np.nan)
+    base = np.full(n, np.nan)
     first_test = first_valid + MIN_TRAIN_BARS
     s = first_test
     while s < n:
         e = min(s + TEST_BLOCK_BARS, n)
-        train = np.arange(first_valid, s - HOLD_BARS + 1)   # purge the last HOLD_BARS
+        train = np.arange(first_valid, s - hold + 1)         # purge the last `hold` bars
         train = train[valid[train]]                          # skip rows with missing features
         model = make_model()
         model.fit(X[train], y[train])
@@ -122,9 +132,9 @@ def walk_forward(df: pd.DataFrame, make_model):
         test = test[valid[test]]                             # no prediction if features missing
         if len(test):
             proba[test] = model.predict_proba(X[test])[:, 1]
-        thresh[s:e] = y[train].mean() + MARGIN
+        base[s:e] = y[train].mean()
         s = e
-    return proba, thresh, first_test
+    return proba, base, first_test
 
 
 # -------------------------------------------------------------------- main
@@ -138,8 +148,8 @@ if __name__ == "__main__":
     first_test = None
     for name, make_model in MODELS.items():
         print(f"Training {name} (walk-forward)...", flush=True)
-        proba, thresh, first_test = walk_forward(df, make_model)
-        all_proba[name] = (proba, thresh)
+        proba, base, first_test = walk_forward(df, make_model)
+        all_proba[name] = (proba, base + MARGIN)          # trade when P(up) beats base rate + MARGIN
 
     ev = df.iloc[first_test:].reset_index(drop=True)          # evaluation window
     print(f"\n{SYMBOL} ({TIMEFRAME}): {len(df):,} candles. Out-of-sample window: "

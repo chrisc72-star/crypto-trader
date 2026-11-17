@@ -179,12 +179,14 @@ def random_entry_signal(n: int, n_trades: int, rng, hold_bars: int = HOLD_BARS) 
     return pd.Series(sig)
 
 
-def random_returns(df: pd.DataFrame, n_trades: int, runs: int = 200, seed: int = 42) -> np.ndarray:
+def random_returns(df: pd.DataFrame, n_trades: int, runs: int = 200, seed: int = 42,
+                   hold_bars: int = HOLD_BARS) -> np.ndarray:
     """Total returns of many random-entry strategies making `n_trades` trades."""
     rng = np.random.default_rng(seed)
     out = []
     for _ in range(runs):
-        equity, _, _ = backtest(df, random_entry_signal(len(df), n_trades, rng))
+        sig = random_entry_signal(len(df), n_trades, rng, hold_bars)
+        equity, _, _ = backtest(df, sig, hold_bars)
         out.append(equity[-1] - 1)
     return np.array(out)
 
